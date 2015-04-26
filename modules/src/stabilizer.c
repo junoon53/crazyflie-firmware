@@ -23,12 +23,12 @@
  *
  *
  */
-#include <math.h>
-
+#include "stm32f10x_conf.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
-#include "config.h"
+#include "math.h"
+
 #include "system.h"
 #include "pm.h"
 #include "stabilizer.h"
@@ -41,9 +41,7 @@
 #include "pid.h"
 #include "ledseq.h"
 #include "param.h"
-//#include "ms5611.h"
-#include "lps25h.h"
-#include "debug.h"
+#include "ms5611.h"
 
 #undef max
 #define max(a,b) ((a) > (b) ? (a) : (b))
@@ -110,7 +108,7 @@ static float vAccDeadband           = 0.05;  // Vertical acceleration deadband
 static float vSpeedASLDeadband      = 0.005; // Vertical speed based on barometer readings deadband
 static float vSpeedLimit            = 0.05;  // used to constrain vertical velocity
 static float errDeadband            = 0.00;  // error (target - altitude) deadband
-static float vBiasAlpha             = 0.98; // Blending factor we use to fuse vSpeedASL and vSpeedAcc
+static float vBiasAlpha             = 0.91; // Blending factor we use to fuse vSpeedASL and vSpeedAcc
 static float aslAlpha               = 0.92; // Short term smoothing
 static float aslAlphaLong           = 0.93; // Long term smoothing
 static uint16_t altHoldMinThrust    = 00000; // minimum hover thrust - not used yet
@@ -134,6 +132,12 @@ uint32_t motorPowerM3;
 
 static bool isInit;
 
+/*****************
+ ** Flight Mode **
+ *****************/
+uint8_t flightMode = 0;
+float cosy, siny; //variable used in CareFree-Mode
+
 static void stabilizerAltHoldUpdate(void);
 static void distributePower(const uint16_t thrust, const int16_t roll,
                             const int16_t pitch, const int16_t yaw);
@@ -156,10 +160,10 @@ void stabilizerInit(void)
   pitchRateDesired = 0;
   yawRateDesired = 0;
 
-  xTaskCreate(stabilizerTask, (const signed char * const)STABILIZER_TASK_NAME,
-              STABILIZER_TASK_STACKSIZE, NULL, STABILIZER_TASK_PRI, NULL);
+  xTaskCreate(stabilizerTask, (const signed char * const)"STABILIZER",
+              2*configMINIMAL_STACK_SIZE, NULL, /*Piority*/2, NULL);
 
-  isInit = true;
+  isInit = TRUE;
 }
 
 bool stabilizerTest(void)
@@ -209,6 +213,28 @@ static void stabilizerTask(void* param)
         accMAG = (acc.x*acc.x) + (acc.y*acc.y) + (acc.z*acc.z);
         // Estimate speed from acc (drifts)
         vSpeed += deadband(accWZ, vAccDeadband) * FUSION_UPDATE_DT;
+
+        if (flightMode == 0) //CareFreeMode
+          {
+            float yawRad = eulerYawActual * M_PI / 180,
+                  roll1 = eulerRollDesired;
+            cosy = cos(yawRad);
+            siny = sin(yawRad);
+            eulerRollDesired = eulerRollDesired * cosy - eulerPitchDesired * siny;
+            eulerPitchDesired = eulerPitchDesired * cosy + roll1 * siny;
+          }
+        else if (flightMode == 2) //X-Mode
+        {
+          //sqrt(2)/2 = 0,707...
+          float roll1 = eulerRollDesired;
+          eulerRollDesired = 0.707 * (eulerRollDesired + eulerPitchDesired);
+          eulerPitchDesired = 0.707 * (eulerPitchDesired - roll1);
+        }
+        else if (flightMode == 3) //Fixed-Mode or Position-Mode
+        {
+          rollRateDesired = 0;
+          pitchRateDesired = 0;
+        }
 
         controllerCorrectAttitudePID(eulerRollActual, eulerPitchActual, eulerYawActual,
                                      eulerRollDesired, eulerPitchDesired, -eulerYawDesired,
@@ -281,8 +307,7 @@ static void stabilizerAltHoldUpdate(void)
 
   // Get barometer height estimates
   //TODO do the smoothing within getData
-  lps25hGetData(&pressure, &temperature, &aslRaw);
-
+  ms5611GetData(&pressure, &temperature, &aslRaw);
   asl = asl * aslAlpha + aslRaw * (1 - aslAlpha);
   aslLong = aslLong * aslAlphaLong + aslRaw * (1 - aslAlphaLong);
 
@@ -360,12 +385,12 @@ static void distributePower(const uint16_t thrust, const int16_t roll,
                             const int16_t pitch, const int16_t yaw)
 {
 #ifdef QUAD_FORMATION_X
-  int16_t r = roll >> 1;
-  int16_t p = pitch >> 1;
-  motorPowerM1 = limitThrust(thrust - r + p + yaw);
-  motorPowerM2 = limitThrust(thrust - r - p - yaw);
-  motorPowerM3 =  limitThrust(thrust + r - p + yaw);
-  motorPowerM4 =  limitThrust(thrust + r + p - yaw);
+  roll = roll >> 1;
+  pitch = pitch >> 1;
+  motorPowerM1 = limitThrust(thrust - roll + pitch + yaw);
+  motorPowerM2 = limitThrust(thrust - roll - pitch - yaw);
+  motorPowerM3 =  limitThrust(thrust + roll - pitch + yaw);
+  motorPowerM4 =  limitThrust(thrust + roll + pitch - yaw);
 #else // QUAD_FORMATION_NORMAL
   motorPowerM1 = limitThrust(thrust + pitch + yaw);
   motorPowerM2 = limitThrust(thrust - roll - yaw);
@@ -499,3 +524,7 @@ PARAM_ADD(PARAM_UINT16, maxThrust, &altHoldMaxThrust)
 PARAM_ADD(PARAM_UINT16, minThrust, &altHoldMinThrust)
 PARAM_GROUP_STOP(altHold)
 
+// Params for flight modes
+PARAM_GROUP_START(FlightMode)
+PARAM_ADD(PARAM_UINT8, flightmode, &flightMode)
+PARAM_GROUP_STOP(FlightMode)
